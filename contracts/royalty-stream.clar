@@ -247,3 +247,88 @@
     (ok true)
   )
 )
+
+
+
+(define-map playlists
+  { playlist-id: uint, owner: principal }
+  {
+    name: (string-ascii 64),
+    songs: (list 100 uint),
+    created-at: uint
+  }
+)
+
+(define-data-var next-playlist-id uint u1)
+
+(define-read-only (get-playlist (playlist-id uint) (owner principal))
+  (map-get? playlists { playlist-id: playlist-id, owner: owner })
+)
+
+(define-public (create-playlist (name (string-ascii 64)))
+  (let
+    (
+      (playlist-id (var-get next-playlist-id))
+    )
+    (map-set playlists
+      { playlist-id: playlist-id, owner: tx-sender }
+      {
+        name: name,
+        songs: (list),
+        created-at: stacks-block-height
+      }
+    )
+    (var-set next-playlist-id (+ playlist-id u1))
+    (ok playlist-id)
+  )
+)
+
+(define-public (add-song-to-playlist (playlist-id uint) (song-id uint))
+  (let
+    (
+      (playlist (unwrap! (get-playlist playlist-id tx-sender) (err u404)))
+      (song (unwrap! (get-song song-id) (err u404)))
+    )
+    (map-set playlists
+      { playlist-id: playlist-id, owner: tx-sender }
+      (merge playlist { songs: (unwrap! (as-max-len? (append (get songs playlist) song-id) u100) (err u403)) })
+    )
+    (ok true)
+  )
+)
+
+
+(define-map artist-tips
+  { artist-id: uint }
+  {
+    total-tips: uint,
+    tip-count: uint
+  }
+)
+
+(define-read-only (get-artist-tips (artist-id uint))
+  (default-to
+    { total-tips: u0, tip-count: u0 }
+    (map-get? artist-tips { artist-id: artist-id })
+  )
+)
+
+(define-public (tip-artist (artist-id uint) (amount uint))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) (err u404)))
+      (current-tips (get-artist-tips artist-id))
+    )
+    (asserts! (> amount u0) (err u403))
+    (try! (stx-transfer? amount tx-sender (get artist-principal artist)))
+    
+    (map-set artist-tips
+      { artist-id: artist-id }
+      {
+        total-tips: (+ (get total-tips current-tips) amount),
+        tip-count: (+ (get tip-count current-tips) u1)
+      }
+    )
+    (ok true)
+  )
+)
