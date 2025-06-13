@@ -332,3 +332,225 @@
     (ok true)
   )
 )
+
+
+(define-map artist-subscriptions
+  { artist-id: uint }
+  {
+    monthly-price: uint,
+    subscriber-count: uint,
+    subscription-enabled: bool,
+    total-subscription-revenue: uint
+  }
+)
+
+(define-map user-subscriptions
+  { subscriber: principal, artist-id: uint }
+  {
+    start-block: uint,
+    end-block: uint,
+    amount-paid: uint,
+    active: bool,
+    auto-renew: bool
+  }
+)
+
+(define-data-var subscription-duration-blocks uint u4320)
+
+(define-read-only (get-artist-subscription (artist-id uint))
+  (map-get? artist-subscriptions { artist-id: artist-id })
+)
+
+(define-read-only (get-user-subscription (subscriber principal) (artist-id uint))
+  (map-get? user-subscriptions { subscriber: subscriber, artist-id: artist-id })
+)
+
+(define-read-only (is-subscription-active (subscriber principal) (artist-id uint))
+  (match (get-user-subscription subscriber artist-id)
+    subscription (and 
+      (get active subscription)
+      (> (get end-block subscription) stacks-block-height)
+    )
+    false
+  )
+)
+
+(define-read-only (get-subscription-duration)
+  (var-get subscription-duration-blocks)
+)
+
+(define-public (enable-artist-subscription (artist-id uint) (monthly-price uint))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) (err u404)))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq tx-sender (get artist-principal artist))
+    ) (err u401))
+    (asserts! (> monthly-price u0) (err u403))
+    
+    (map-set artist-subscriptions
+      { artist-id: artist-id }
+      {
+        monthly-price: monthly-price,
+        subscriber-count: u0,
+        subscription-enabled: true,
+        total-subscription-revenue: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-artist (artist-id uint))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) (err u404)))
+      (subscription-info (unwrap! (get-artist-subscription artist-id) (err u404)))
+      (monthly-price (get monthly-price subscription-info))
+      (platform-fee (/ (* monthly-price (var-get platform-fee-percent)) u100))
+      (artist-payment (- monthly-price platform-fee))
+      (current-block stacks-block-height)
+      (end-block (+ current-block (var-get subscription-duration-blocks)))
+      (existing-sub (get-user-subscription tx-sender artist-id))
+    )
+    (asserts! (get subscription-enabled subscription-info) (err u403))
+    (asserts! (get active artist) (err u403))
+    (asserts! (not (is-subscription-active tx-sender artist-id)) (err u409))
+    
+    (try! (stx-transfer? monthly-price tx-sender (var-get contract-owner)))
+    (try! (stx-transfer? artist-payment (var-get contract-owner) (get artist-principal artist)))
+    
+    (map-set user-subscriptions
+      { subscriber: tx-sender, artist-id: artist-id }
+      {
+        start-block: current-block,
+        end-block: end-block,
+        amount-paid: monthly-price,
+        active: true,
+        auto-renew: false
+      }
+    )
+    
+    (map-set artist-subscriptions
+      { artist-id: artist-id }
+      (merge subscription-info {
+        subscriber-count: (+ (get subscriber-count subscription-info) u1),
+        total-subscription-revenue: (+ (get total-subscription-revenue subscription-info) artist-payment)
+      })
+    )
+    
+    (map-set artists
+      { artist-id: artist-id }
+      (merge artist {
+        total-earnings: (+ (get total-earnings artist) artist-payment)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (stream-song-with-subscription (song-id uint))
+  (let
+    (
+      (song (unwrap! (get-song song-id) (err u404)))
+      (artist-id (get artist-id song))
+      (artist (unwrap! (get-artist artist-id) (err u404)))
+      (stream-id (var-get next-stream-id))
+      (listener-info (default-to { total-streams: u0, total-spent: u0 } (get-listener tx-sender)))
+    )
+    (asserts! (get active song) (err u403))
+    (asserts! (get active artist) (err u403))
+    (asserts! (is-subscription-active tx-sender artist-id) (err u402))
+    
+    (map-set stream-history
+      { stream-id: stream-id }
+      {
+        listener: tx-sender,
+        song-id: song-id,
+        artist-id: artist-id,
+        timestamp: stacks-block-height,
+        amount-paid: u0
+      }
+    )
+    
+    (map-set songs
+      { song-id: song-id }
+      (merge song { total-streams: (+ (get total-streams song) u1) })
+    )
+    
+    (map-set artists
+      { artist-id: artist-id }
+      (merge artist { 
+        total-streams: (+ (get total-streams artist) u1)
+      })
+    )
+    
+    (map-set listeners
+      { listener-principal: tx-sender }
+      {
+        total-streams: (+ (get total-streams listener-info) u1),
+        total-spent: (get total-spent listener-info)
+      }
+    )
+    
+    (var-set next-stream-id (+ stream-id u1))
+    (ok stream-id)
+  )
+)
+
+(define-public (cancel-subscription (artist-id uint))
+  (let
+    (
+      (subscription (unwrap! (get-user-subscription tx-sender artist-id) (err u404)))
+      (subscription-info (unwrap! (get-artist-subscription artist-id) (err u404)))
+    )
+    (asserts! (get active subscription) (err u403))
+    
+    (map-set user-subscriptions
+      { subscriber: tx-sender, artist-id: artist-id }
+      (merge subscription { active: false })
+    )
+    
+    (map-set artist-subscriptions
+      { artist-id: artist-id }
+      (merge subscription-info {
+        subscriber-count: (- (get subscriber-count subscription-info) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-subscription-duration (new-duration uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (> new-duration u0) (err u403))
+    (var-set subscription-duration-blocks new-duration)
+    (ok new-duration)
+  )
+)
+
+(define-public (disable-artist-subscription (artist-id uint))
+  (let
+    (
+      (artist (unwrap! (get-artist artist-id) (err u404)))
+      (subscription-info (unwrap! (get-artist-subscription artist-id) (err u404)))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq tx-sender (get artist-principal artist))
+    ) (err u401))
+    
+    (map-set artist-subscriptions
+      { artist-id: artist-id }
+      (merge subscription-info { subscription-enabled: false })
+    )
+    (ok true)
+  )
+)
+
+
