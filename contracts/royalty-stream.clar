@@ -190,6 +190,9 @@
       }
     )
     
+    (update-streams-leaderboard song-id (+ (get total-streams song) u1))
+    (update-earnings-leaderboard song-id (* (+ (get total-streams song) u1) stream-price))
+    
     (var-set next-stream-id (+ stream-id u1))
     (ok stream-id)
   )
@@ -553,4 +556,121 @@
   )
 )
 
+(define-map leaderboard-by-streams
+  { position: uint }
+  {
+    song-id: uint,
+    stream-count: uint,
+    last-updated: uint
+  }
+)
 
+(define-map leaderboard-by-earnings
+  { position: uint }
+  {
+    song-id: uint,
+    total-earnings: uint,
+    last-updated: uint
+  }
+)
+
+(define-data-var leaderboard-size uint u10)
+
+(define-read-only (get-streams-leaderboard (position uint))
+  (map-get? leaderboard-by-streams { position: position })
+)
+
+(define-read-only (get-earnings-leaderboard (position uint))
+  (map-get? leaderboard-by-earnings { position: position })
+)
+
+(define-read-only (get-leaderboard-size)
+  (var-get leaderboard-size)
+)
+
+(define-private (update-streams-leaderboard (song-id uint) (stream-count uint))
+  (let
+    (
+      (leaderboard-size-val (var-get leaderboard-size))
+      (current-block stacks-block-height)
+    )
+    (map-set leaderboard-by-streams
+      { position: u1 }
+      {
+        song-id: song-id,
+        stream-count: stream-count,
+        last-updated: current-block
+      }
+    )
+    true
+  )
+)
+
+(define-private (update-earnings-leaderboard (song-id uint) (earnings uint))
+  (let
+    (
+      (leaderboard-size-val (var-get leaderboard-size))
+      (current-block stacks-block-height)
+    )
+    (map-set leaderboard-by-earnings
+      { position: u1 }
+      {
+        song-id: song-id,
+        total-earnings: earnings,
+        last-updated: current-block
+      }
+    )
+    true
+  )
+)
+
+(define-read-only (get-top-songs-by-streams (limit uint))
+  (let
+    (
+      (max-limit (if (<= limit (var-get leaderboard-size)) limit (var-get leaderboard-size)))
+    )
+    (map get-streams-leaderboard (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+  )
+)
+
+(define-read-only (get-top-songs-by-earnings (limit uint))
+  (let
+    (
+      (max-limit (if (<= limit (var-get leaderboard-size)) limit (var-get leaderboard-size)))
+    )
+    (map get-earnings-leaderboard (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+  )
+)
+
+(define-public (refresh-leaderboards)
+  (let
+    (
+      (song-1 (get-song u1))
+      (song-2 (get-song u2))
+      (song-3 (get-song u3))
+    )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (match song-1
+      song-data (update-streams-leaderboard u1 (get total-streams song-data))
+      false
+    )
+    (match song-2
+      song-data (update-streams-leaderboard u2 (get total-streams song-data))
+      false
+    )
+    (match song-3
+      song-data (update-streams-leaderboard u3 (get total-streams song-data))
+      false
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-leaderboard-size (new-size uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (and (> new-size u0) (<= new-size u50)) (err u403))
+    (var-set leaderboard-size new-size)
+    (ok new-size)
+  )
+)
