@@ -135,6 +135,9 @@
         active: true
       }
     )
+    ;; Auto-enable dynamic pricing for new songs
+    (initialize-song-pricing song-id price-per-stream)
+    
     (var-set next-song-id (+ song-id u1))
     (ok song-id)
   )
@@ -146,7 +149,7 @@
       (song (unwrap! (get-song song-id) (err u404)))
       (artist-id (get artist-id song))
       (artist (unwrap! (get-artist artist-id) (err u404)))
-      (stream-price (get price-per-stream song))
+      (stream-price (unwrap! (get-current-song-price song-id) (err u500)))
       (stream-id (var-get next-stream-id))
       (platform-fee (/ (* stream-price (var-get platform-fee-percent)) u100))
       (artist-payment (- stream-price platform-fee))
@@ -188,6 +191,12 @@
         total-streams: (+ (get total-streams listener-info) u1),
         total-spent: (+ (get total-spent listener-info) stream-price)
       }
+    )
+    
+    ;; Update demand metrics for dynamic pricing if enabled
+    (match (get-song-pricing-data song-id)
+      pricing-data (update-song-demand song-id)
+      true
     )
     
     (update-streams-leaderboard song-id (+ (get total-streams song) u1))
@@ -674,3 +683,228 @@
     (ok new-size)
   )
 )
+
+;; Dynamic Pricing Engine
+(define-map song-pricing-data
+  { song-id: uint }
+  {
+    base-price: uint,
+    release-block: uint,
+    recent-streams: uint,
+    last-stream-block: uint,
+    demand-multiplier: uint,
+    max-price: uint
+  }
+)
+
+(define-map pricing-config
+  { config-key: (string-ascii 32) }
+  { config-value: uint }
+)
+
+;; Pricing parameters with default values
+(define-data-var demand-decay-rate uint u50) ;; Percentage decay per 144 blocks (~1 day)
+(define-data-var recency-bonus-blocks uint u1008) ;; Blocks for recency bonus (~1 week)
+(define-data-var demand-threshold uint u10) ;; Streams needed for price increase
+(define-data-var max-price-multiplier uint u300) ;; Maximum 3x price increase
+(define-data-var price-adjustment-interval uint u144) ;; Blocks between adjustments
+
+(define-read-only (get-song-pricing-data (song-id uint))
+  (map-get? song-pricing-data { song-id: song-id })
+)
+
+(define-read-only (get-pricing-config (config-key (string-ascii 32)))
+  (map-get? pricing-config { config-key: config-key })
+)
+
+(define-read-only (get-demand-decay-rate)
+  (var-get demand-decay-rate)
+)
+
+(define-read-only (get-recency-bonus-blocks)
+  (var-get recency-bonus-blocks)
+)
+
+;; Initialize pricing data for a song
+(define-private (initialize-song-pricing (song-id uint) (base-price uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (max-price (* base-price (/ (var-get max-price-multiplier) u100)))
+    )
+    (map-set song-pricing-data
+      { song-id: song-id }
+      {
+        base-price: base-price,
+        release-block: current-block,
+        recent-streams: u0,
+        last-stream-block: current-block,
+        demand-multiplier: u100,
+        max-price: max-price
+      }
+    )
+    true
+  )
+)
+
+;; Calculate current dynamic price for a song
+(define-read-only (calculate-dynamic-price (song-id uint))
+  (let
+    (
+      (song-data (unwrap! (get-song song-id) (err u404)))
+      (pricing-data (unwrap! (get-song-pricing-data song-id) (err u404)))
+      (current-block stacks-block-height)
+      (base-price (get base-price pricing-data))
+      (release-block (get release-block pricing-data))
+      (recent-streams (get recent-streams pricing-data))
+      (last-stream-block (get last-stream-block pricing-data))
+      (demand-multiplier (get demand-multiplier pricing-data))
+      (max-price (get max-price pricing-data))
+      
+      ;; Calculate recency bonus (newer songs cost more)
+      (blocks-since-release (- current-block release-block))
+      (recency-multiplier 
+        (if (<= blocks-since-release (var-get recency-bonus-blocks))
+          (+ u100 (/ (* u50 (- (var-get recency-bonus-blocks) blocks-since-release)) (var-get recency-bonus-blocks)))
+          u100
+        )
+      )
+      
+      ;; Calculate demand decay
+      (blocks-since-last-stream (- current-block last-stream-block))
+      (decay-periods (/ blocks-since-last-stream (var-get price-adjustment-interval)))
+      (decay-amount (* decay-periods (var-get demand-decay-rate)))
+      (adjusted-demand-multiplier 
+        (if (> demand-multiplier decay-amount)
+          (- demand-multiplier decay-amount)
+          u100
+        )
+      )
+      
+      ;; Calculate final price
+      (price-with-demand (/ (* base-price adjusted-demand-multiplier) u100))
+      (price-with-recency (/ (* price-with-demand recency-multiplier) u100))
+      (final-price (if (> price-with-recency max-price) max-price price-with-recency))
+    )
+    (ok final-price)
+  )
+)
+
+;; Update demand metrics when a song is streamed
+(define-private (update-song-demand (song-id uint))
+  (let
+    (
+      (current-pricing (unwrap! (get-song-pricing-data song-id) false))
+      (current-block stacks-block-height)
+      (blocks-since-last (- current-block (get last-stream-block current-pricing)))
+      (recent-streams (get recent-streams current-pricing))
+      (demand-multiplier (get demand-multiplier current-pricing))
+      
+      ;; Reset recent streams if too much time has passed
+      (updated-recent-streams 
+        (if (> blocks-since-last (var-get price-adjustment-interval))
+          u1
+          (+ recent-streams u1)
+        )
+      )
+      
+      ;; Increase demand multiplier if threshold is met
+      (new-demand-multiplier
+        (if (>= updated-recent-streams (var-get demand-threshold))
+          (let
+            (
+              (increase-amount u20) ;; 20% increase
+              (new-multiplier (+ demand-multiplier increase-amount))
+              (max-multiplier (var-get max-price-multiplier))
+            )
+            (if (> new-multiplier max-multiplier) max-multiplier new-multiplier)
+          )
+          demand-multiplier
+        )
+      )
+    )
+    (map-set song-pricing-data
+      { song-id: song-id }
+      (merge current-pricing {
+        recent-streams: updated-recent-streams,
+        last-stream-block: current-block,
+        demand-multiplier: new-demand-multiplier
+      })
+    )
+    true
+  )
+)
+
+;; Get current price for streaming (used by streaming functions)
+(define-read-only (get-current-song-price (song-id uint))
+  (match (get-song-pricing-data song-id)
+    pricing-data (calculate-dynamic-price song-id)
+    (match (get-song song-id)
+      song-data (ok (get price-per-stream song-data))
+      (err u404)
+    )
+  )
+)
+
+;; Admin function to set pricing parameters
+(define-public (set-demand-decay-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (<= new-rate u100) (err u403)) ;; Max 100% decay
+    (var-set demand-decay-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-public (set-recency-bonus-blocks (new-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (> new-blocks u0) (err u403))
+    (var-set recency-bonus-blocks new-blocks)
+    (ok new-blocks)
+  )
+)
+
+(define-public (set-demand-threshold (new-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (> new-threshold u0) (err u403))
+    (var-set demand-threshold new-threshold)
+    (ok new-threshold)
+  )
+)
+
+(define-public (set-max-price-multiplier (new-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (and (>= new-multiplier u100) (<= new-multiplier u500)) (err u403)) ;; 1x to 5x
+    (var-set max-price-multiplier new-multiplier)
+    (ok new-multiplier)
+  )
+)
+
+;; Enable dynamic pricing for existing song
+(define-public (enable-dynamic-pricing (song-id uint))
+  (let
+    (
+      (song-data (unwrap! (get-song song-id) (err u404)))
+      (base-price (get price-per-stream song-data))
+    )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (is-none (get-song-pricing-data song-id)) (err u409)) ;; Already enabled
+    (initialize-song-pricing song-id base-price)
+    (ok true)
+  )
+)
+
+;; Disable dynamic pricing for a song
+(define-public (disable-dynamic-pricing (song-id uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
+    (asserts! (is-some (get-song-pricing-data song-id)) (err u404))
+    (map-delete song-pricing-data { song-id: song-id })
+    (ok true)
+  )
+)
+
+
